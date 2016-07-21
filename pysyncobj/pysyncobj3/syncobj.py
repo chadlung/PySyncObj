@@ -63,6 +63,11 @@ class SyncObj(object):
         self.__forceLogCompaction = False
         self.__leaderCommitIndex = None
         self.__onReadyCalled = False
+        self.__changeClusterIDx = None
+        self.__noopIDx = None
+
+
+        self.__startTime = time.time()
         globalDnsResolver().setTimeouts(self.__conf.dnsCacheTime, self.__conf.dnsFailCacheTime)
         self.__serializer = Serializer(self.__conf.fullDumpFile, self.__conf.logCompactionBatchSize)
         self.__isInitialized = False
@@ -121,6 +126,12 @@ class SyncObj(object):
         except:
             LOG_CURRENT_EXCEPTION()
 
+    def _addNodeToCluster(self, nodeName, callback = None):
+        self._applyCommand(pickle.dumps(['add', nodeName]), callback)
+
+    def _removeNodeFromCluster(self, nodeName, callback = None):
+        self._applyCommand(pickle.dumps(['rem', nodeName]), callback)
+
     def _applyCommand(self, command, callback):
         try:
             self.__commandsQueue.put_nowait((command, callback))
@@ -144,19 +155,26 @@ class SyncObj(object):
 
             if self.__raftState == _RAFT_STATE.LEADER:
                 idx, term = self.__getCurrentLogIndex() + 1, self.__raftCurrentTerm
-                self.__raftLog.append((command, idx, term))
-                if requestNode is None:
-                    if callback is not None:
-                        self.__commandsWaitingCommit[idx].append((term, callback))
-                else:
-                    self.__send(requestNode, {
-                        'type': 'apply_command_response',
-                        'request_id': requestID,
-                        'log_idx': idx,
-                        'log_term': term,
-                    })
-                if not self.__conf.appendEntriesUseBatch:
-                    self.__sendAppendEntries()
+
+                changeClusterRequest = self.__parseChangeClusterRequest(command)
+
+                if changeClusterRequest is None or self.__changeCluster(changeClusterRequest):
+
+                    self.__raftLog.append((command, idx, term))
+
+                    if requestNode is None:
+                        if callback is not None:
+                            self.__commandsWaitingCommit[idx].append((term, callback))
+                    else:
+                        self.__send(requestNode, {
+                            'type': 'apply_command_response',
+                            'request_id': requestID,
+                            'log_idx': idx,
+                            'log_term': term,
+                        })
+                    if not self.__conf.appendEntriesUseBatch:
+                        self.__sendAppendEntries()
+
             elif self.__raftLeader is not None:
                 if requestNode is None:
                     message = {
@@ -284,6 +302,8 @@ class SyncObj(object):
         LOG_DEBUG('raft term:', self.__raftCurrentTerm)
         LOG_DEBUG('next node idx:', self.__raftNextIndex)
         LOG_DEBUG('match idx:', self.__raftMatchIndex)
+        LOG_DEBUG('leader commit idx:', self.__leaderCommitIndex)
+        LOG_DEBUG('uptime:', int(time.time() - self.__startTime))
         LOG_DEBUG('')
 
     def _forceLogCompaction(self):
@@ -294,6 +314,9 @@ class SyncObj(object):
         if command == '':
             return
         command = pickle.loads(command)
+        # Skip change-cluster command
+        if isinstance(command, list):
+            return
         args = []
         kwargs = {
             '_doApply': True,
@@ -367,8 +390,14 @@ class SyncObj(object):
                     self.__sendNextNodeIdx(nodeAddr, nextNodeIdx = prevLogIdx, success = False, reset=True)
                     return
                 if len(prevEntries) > 1:
+                    #todo: implement cluster configuration rollback
                     self.__deleteEntriesFrom(prevLogIdx + 1)
                 self.__raftLog += newEntries
+                for entry in newEntries:
+                    clusterChangeRequest = self.__parseChangeClusterRequest(entry[0])
+                    if clusterChangeRequest is not None:
+                        self.__doChangeCluster(clusterChangeRequest)
+
                 nextNodeIdx = prevLogIdx + 1
                 if newEntries:
                     nextNodeIdx = newEntries[-1][1]
@@ -551,7 +580,11 @@ class SyncObj(object):
             self.__raftMatchIndex[nodeAddr] = 0
 
         # No-op command after leader election.
-        self._applyCommand('', None)
+        idx, term = self.__getCurrentLogIndex() + 1, self.__raftCurrentTerm
+        self.__raftLog.append(('', idx, term))
+        self.__noopIDx = idx
+        if not self.__conf.appendEntriesUseBatch:
+            self.__sendAppendEntries()
 
         self.__sendAppendEntries()
 
@@ -640,6 +673,57 @@ class SyncObj(object):
 
     def _getEncryptor(self):
         return self.__encryptor
+
+    def __changeCluster(self, request):
+        if self.__raftLastApplied < self.__noopIDx:
+            # No-op entry was not commited yet
+            return False
+
+        if self.__changeClusterIDx is not None:
+            if self.__raftLastApplied >= self.__changeClusterIDx:
+                self.__changeClusterIDx = None
+
+        # Previous cluster change request was not commited yet
+        if self.__changeClusterIDx is not None:
+            return False
+
+        return self.__doChangeCluster(request)
+
+    def __doChangeCluster(self, request):
+        if request[0] == 'add':
+            newNode = request[1]
+            # Node already exists in cluster
+            if newNode == self.__selfNodeAddr or newNode in self.__otherNodesAddrs:
+                return False
+            self.__otherNodesAddrs.append(newNode)
+            self.__nodes.append(Node(self, newNode))
+            self.__raftNextIndex[newNode] = 0
+            self.__raftMatchIndex[newNode] = 0
+            return True
+        if request[0] == 'rem':
+            oldNode = request[1]
+            if oldNode == self.__selfNodeAddr:
+                return False
+            if oldNode not in self.__otherNodesAddrs:
+                return False
+            for i in range(len(self.__nodes)):
+                if self.__nodes[i].getAddress() == oldNode:
+                    self.__nodes[i].remove()
+                    self.__nodes.pop(i)
+                    self.__otherNodesAddrs.pop(i)
+                    del self.__raftNextIndex[oldNode]
+                    del self.__raftNextIndex[oldNode]
+                    return True
+            return False
+        return False
+
+    def __parseChangeClusterRequest(self, command):
+        if command == '':
+            return None
+        request = pickle.loads(command)
+        if not isinstance(request, list):
+            return None
+        return request
 
     def __tryLogCompaction(self):
         currTime = time.time()
